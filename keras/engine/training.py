@@ -17,11 +17,19 @@
 import copy
 import itertools
 import json
+import threading
+import time
 import warnings
 import weakref
 
 import numpy as np
 import tensorflow.compat.v2 as tf
+from tensorflow.python.distribute import distribute_utils
+from tensorflow.python.distribute import input_ops
+from tensorflow.python.eager import context
+from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.util.tf_export import keras_export
+from tensorflow.tools.docs import doc_controls
 
 from keras import backend
 from keras import callbacks as callbacks_module
@@ -52,14 +60,6 @@ from keras.utils import tf_utils
 from keras.utils import traceback_utils
 from keras.utils import version_utils
 from keras.utils.mode_keys import ModeKeys
-
-# isort: off
-from tensorflow.python.eager import context
-from tensorflow.python.platform import tf_logging as logging
-from tensorflow.python.util.tf_export import keras_export
-from tensorflow.python.distribute import distribute_utils
-from tensorflow.python.distribute import input_ops
-from tensorflow.tools.docs import doc_controls
 
 try:
     import h5py
@@ -319,6 +319,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         self._checkpoint = tf.train.Checkpoint(root=weakref.ref(self))
 
         self._steps_per_execution = None
+        self._enable_tune_steps_per_execution = False
 
         self._init_batch_counters()
         self._base_model_initialized = True
@@ -687,16 +688,18 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
               `run_eagerly=True` is not supported when using
               `tf.distribute.experimental.ParameterServerStrategy`. Defaults to
                `False`.
-            steps_per_execution: Int. The number of batches to
-              run during each `tf.function` call. Running multiple batches
-              inside a single `tf.function` call can greatly improve performance
-              on TPUs or small models with a large Python overhead. At most, one
-              full epoch will be run each execution. If a number larger than the
-              size of the epoch is passed, the execution will be truncated to
-              the size of the epoch. Note that if `steps_per_execution` is set
-              to `N`, `Callback.on_batch_begin` and `Callback.on_batch_end`
-              methods will only be called every `N` batches (i.e. before/after
-              each `tf.function` execution). Defaults to `1`.
+            steps_per_execution: Int or 'auto'. The number of batches to
+              run during each `tf.function` call. If set to "auto", keras will
+              automatically tune steps_per_execution during runtime. Running
+              multiple batches inside a single `tf.function` call can greatly
+              improve performance on TPUs or small models with a large Python
+              overhead. At most, one full epoch will be run each execution. If a
+              number larger than the size of the epoch is passed, the execution
+              will be truncated to the size of the epoch. Note that if
+              `steps_per_execution` is set to `N`, `Callback.on_batch_begin` and
+              `Callback.on_batch_end` methods will only be called every `N`
+              batches (i.e. before/after each `tf.function` execution).
+              Defaults to `1`.
             jit_compile: If `True`, compile the model training step with XLA.
               [XLA](https://www.tensorflow.org/xla) is an optimizing compiler
               for machine learning.
@@ -771,7 +774,11 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 from_serialized=from_serialized,
             )
 
-            self._configure_steps_per_execution(steps_per_execution or 1)
+            if steps_per_execution == "auto":
+                self._configure_steps_per_execution(1)
+                self._configure_steps_per_execution_tuner()
+            else:
+                self._configure_steps_per_execution(steps_per_execution or 1)
 
             self._pss_evaluation_shards = self._infer_exact_eval_shards(
                 pss_evaluation_shards
@@ -967,6 +974,126 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     @run_eagerly.setter
     def run_eagerly(self, value):
         self._run_eagerly = value
+
+    @property
+    def enable_tune_steps_per_execution(self):
+        return self._enable_tune_steps_per_execution
+
+    @enable_tune_steps_per_execution.setter
+    def enable_tune_steps_per_execution(self, value):
+        self._enable_tune_steps_per_execution = value
+
+    def _configure_steps_per_execution_tuner(
+        self, change_spe_interval=10, change_threshold=0.1
+    ):
+        self._steps_per_execution_stop_event = threading.Event()
+        self._change_spe_interval = change_spe_interval
+        self._spe_change_threshold = change_threshold
+
+    def _steps_per_execution_interval_call(self):
+        while not self._steps_per_execution_stop_event:
+            self._measure_throughput_tune_steps_per_execution()
+            self._steps_per_execution_stop_event.wait(self.interval)
+
+    def _begin_tuning_steps_per_execution(self):
+        self._start_time = time.time()
+        self._init_iterations = self.optimizer.iterations.numpy()
+        self._init_spe = self._steps_per_execution.numpy().item()
+        self._spe_last_logged = {
+            "iteration": self.init_iterations,
+            "time_secs": self.start_time,
+        }
+        self._rgsps = []  # rgsps = recent global steps per second
+        self._avg_rgsps = 0
+        self._prev_avg_rgsps = 0
+        self._spe_tune_last_action_add = True
+        self._spe_measurement_count = 0
+
+    def _end_tuning_steps_per_execution(self):
+        if self._steps_per_execution_stop_event:
+            self._steps_per_execution_stop_event.set()
+
+    def _should_tune_steps_per_execution(self):
+        epoch_boundary = False
+        if self._rgsps[-1] == 0:
+            epoch_boundary = True
+
+        return (
+            self._spe_measurement_count % self._change_spe_interval == 0
+            and self._rgsps
+            and self._enable_tune_steps_per_execution
+            and not epoch_boundary
+        )
+
+    def _tune_steps_per_execution(self):
+        """Changes the steps per execution using the following algorithm.
+
+        If there is more than a 10% increase in the throughput, then the last
+        recorded action is repeated (i.e. if increasing the SPE caused an
+        increase in throughput, it is increased again). If there is more than a
+        10% decrease in the throughput, then the opposite of the last action is
+        performed (i.e. if increasing the SPE decreased the throughput, then the
+        SPE is decreased).
+        """
+        self._avg_rgsps = sum(self._rgsps) / len(self._rgsps)
+        fast_threshold = (1 + self._spe_change_threshold) * self._prev_avg_rgsps
+        slow_threshold = (1 - self._spe_change_threshold) * self._prev_avg_rgsps
+
+        if self._spe_tune_last_action_add:
+            repeat_action_mult = 1.5
+            opposite_action_mult = 0.5
+        else:
+            repeat_action_mult = 0.5
+            opposite_action_mult = 1.5
+
+        spe_variable = self._steps_per_execution
+        spe_limit = spe_variable.dtype.max / 1.5
+        current_spe = spe_variable.numpy().item()
+        if self._avg_rgsps > fast_threshold:
+            # Note that our first iteration will always trigger this as our
+            # threshold should be 0
+            new_spe = current_spe * repeat_action_mult
+        elif self._avg_rgsps < slow_threshold:
+            new_spe = current_spe * opposite_action_mult
+            self._spe_tune_last_action_add = not self._spe_tune_last_action_add
+        else:
+            new_spe = current_spe
+
+        if current_spe >= spe_limit:
+            new_spe = current_spe
+        elif current_spe == 0:
+            new_spe = self._init_spe
+
+        self._steps_per_execution.assign(np.round(new_spe))
+        self._prev_avg_rgsps = self._avg_rgsps
+
+    def _measure_throughput_tune_steps_per_execution(self):
+        self._spe_measurement_count += 1
+
+        cur_iteration = self.optimizer.iterations.numpy()
+
+        cur_time_secs = time.time()
+        recent_gsps = (cur_iteration - self._spe_last_logged["iteration"]) / (
+            cur_time_secs - self._spe_last_logged["time_secs"]
+        )
+
+        self._rgsps.append(recent_gsps)
+        if len(self._rgsps) > self._change_spe_interval:
+            self._rgsps.pop(0)
+
+        if cur_iteration == 0:  # No need to tune, we have no measurements
+            self._start_time = cur_time_secs
+            return
+
+        self._spe_last_logged["iteration"] = cur_iteration
+        self._spe_last_logged["time_secs"] = cur_time_secs
+
+        try:
+            if self._should_tune_steps_per_execution():
+                self._tune_steps_per_execution()
+        except RuntimeError:
+            logging.exception("SPE tuning failed at trigger.")
+            return
 
     @property
     def jit_compile(self):
@@ -1331,6 +1458,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         if (
             self._steps_per_execution is None
             or self._steps_per_execution.numpy().item() == 1
+            and not self.enable_tune_steps_per_execution
         ):
 
             def train_function(iterator):
@@ -1713,6 +1841,13 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             self._train_counter.assign(0)
             callbacks.on_train_begin()
             training_logs = None
+            if self.enable_tune_steps_per_execution:
+                self._begin_tuning_steps_per_execution()
+                self._steps_per_execution_thread = threading.Thread(
+                    target=self._measure_throughput_tune_steps_per_execution(),
+                    daemon=True,
+                )  # needed to shut down successfully
+                self._steps_per_execution_thread.start()
             # Handle fault-tolerance for multi-worker.
             # TODO(omalleyt): Fix the ordering issues that mean this has to
             # happen after `callbacks.on_train_begin`.
@@ -1819,6 +1954,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             # If eval data_handler exists, delete it after all epochs are done.
             if getattr(self, "_eval_data_handler", None) is not None:
                 del self._eval_data_handler
+            if self.enable_tune_steps_per_execution:
+                self._end_tuning_steps_per_execution()
             callbacks.on_train_end(logs=training_logs)
             return self.history
 
@@ -1991,6 +2128,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         if (
             self._steps_per_execution is None
             or self._steps_per_execution.numpy().item() == 1
+            and not self.enable_tune_steps_per_execution
         ):
 
             def test_function(iterator):
@@ -2212,6 +2350,13 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             test_function_runner = self._get_test_function_runner(callbacks)
             self._test_counter.assign(0)
             callbacks.on_test_begin()
+            if self.enable_tune_steps_per_execution:
+                self._begin_tuning_steps_per_execution()
+                self._steps_per_execution_thread = threading.Thread(
+                    target=self._measure_throughput_tune_steps_per_execution(),
+                    daemon=True,
+                )  # needed to shut down successfully
+                self._steps_per_execution_thread.start()
             for (
                 _,
                 dataset_or_iterator,
@@ -2236,6 +2381,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                 logs = self._aggregate_exact_metrics(logs)
             else:
                 logs = self._validate_and_get_metrics_result(logs)
+            if self.enable_tune_steps_per_execution:
+                self._end_tuning_steps_per_execution()
             callbacks.on_test_end(logs=logs)
 
             if return_dict:
@@ -2360,6 +2507,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         if (
             self._steps_per_execution is None
             or self._steps_per_execution.numpy().item() == 1
+            and not self.enable_tune_steps_per_execution
         ):
 
             def predict_function(iterator):
@@ -2572,6 +2720,13 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             self.predict_function = self.make_predict_function()
             self._predict_counter.assign(0)
             callbacks.on_predict_begin()
+            if self.enable_tune_steps_per_execution:
+                self._begin_tuning_steps_per_execution()
+                self._steps_per_execution_thread = threading.Thread(
+                    target=self._measure_throughput_tune_steps_per_execution(),
+                    daemon=True,
+                )  # needed to shut down successfully
+                self._steps_per_execution_thread.start()
             batch_outputs = None
             for _, iterator in data_handler.enumerate_epochs():  # Single epoch.
                 with data_handler.catch_stop_iteration():
@@ -2610,6 +2765,8 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
                     "information of where went wrong, or file a "
                     "issue/bug to `tf.keras`."
                 )
+            if self.enable_tune_steps_per_execution:
+                self._end_tuning_steps_per_execution()
             callbacks.on_predict_end()
         all_outputs = tf.__internal__.nest.map_structure_up_to(
             batch_outputs, potentially_ragged_concat, outputs
